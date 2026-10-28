@@ -1,0 +1,4 @@
+case_id,booking_reference,flight_number,departure_date,booking_channel,status,next_action,draft_file,errors
+CASE001,ABC123,W62345,2026-11-15,direct,READY_FOR_MANUAL_REVIEW,"Open the official Wizz Air page, sign in manually, verify the booking and select the cash/original-payment option if offered. This tool will not submit the request.",C:\Coding\REFUNDS\WizzAir\refund_requests\CASE001_ABC123.txt,
+CASE002,DEF456,W61234,2026-11-20,agency,AGENCY_MANUAL_ACTION,Contact booking provider (Example Travel Agency) and request a refund to the original payment method; do not submit through Wizz Air unless the agency or Wizz Air instructs you to.,,
+CASE003,GHI789,W61234,2026-11-25,direct,ELIGIBILITY_REVIEW,Cancellation by airline is not confirmed. Check the booking terms and official options; no refund entitlement is assumed.,,

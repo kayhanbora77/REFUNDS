@@ -1,0 +1,4 @@
+case_id,booking_reference,flight_number,departure_date,booking_channel,cancellation_by_airline,agency_name
+CASE001,ABC123,W62345,2026-11-15,direct,yes,
+CASE002,DEF456,W61234,2026-11-20,agency,yes,Example Travel Agency
+CASE003,GHI789,W61234,2026-11-25,direct,no,
