@@ -4,20 +4,34 @@ Air France Delay / Cancellation Claim Filler  (V5)
 V5 vs V4:
 - ALL values now come from the CSV — no hardcoded defaults, no random mock data.
   The script refuses to run if any required column is missing or empty.
-- New required column "Files": a list of one or more file paths to attach
-  on the wizard Step 2 (Expenses incurred) page. Multiple file paths are
+- New required column "Files": a list of one or more file OR folder paths to
+  attach on the wizard Step 2 (Expenses incurred) page. Multiple entries are
   separated by the pipe character "|".
-  Example CSV cell value (single file):
-      C:\\Coding\\APPLY_AIRLINE\\AirFrance\\tickets\\boarding_pass.pdf
-  Example CSV cell value (multiple files):
-      C:\\path\\to\\file1.pdf|C:\\path\\to\\file2.pdf|C:\\path\\to\\file3.jpg
+    * If an entry is a folder, EVERY file inside that folder (recursively,
+      including sub-folders) is attached.
+    * If an entry is a regular file, that file is attached directly.
+  Example CSV cell value (single folder):
+      C:\\Coding\\APPLY_AIRLINE\\AirFrance\\files
+  Example CSV cell value (multiple folders):
+      C:\\path\\to\\folder1|C:\\path\\to\\folder2
+  Example CSV cell value (mix of files and folders):
+      C:\\path\\to\\specific.pdf|C:\\path\\to\\documents_folder
 - Step 2 (Expenses incurred) now:
     * Clicks "No" radio for additional expenses.
     * Uploads the file(s) listed in the "Files" column by clicking the
       "Drop your files here or browse files on your computer" drop zone
       and feeding the file paths to the resulting OS file chooser
       (and/or the hidden <input type="file"> element).
-    * Fills the context textbox with the DisruptionReason value.
+    * Fills the context textbox with a fixed reason string derived from
+      the Status column (see below) — the CSV no longer needs a
+      DisruptionReason column.
+- Disruption reason is now derived from Status (no longer a free-text CSV column):
+      Status=Delay     -> DELAY_REASON  = "Flight was delayed by over 3 hours
+                                           causing inconvenience to travel plans."
+      Status=Cancel    -> CANCEL_REASON = "Cancellation caused significant inconvenience
+                                           to my travel plans."
+      Status=MissConn  -> MISSCONN_REASON = "Connecting flight was missed because of
+                                             late arrival."
 - Default CSV / drafts paths are the user's project paths on Windows:
       C:\\Coding\\APPLY_AIRLINE\\AirFrance\\info.csv
       C:\\Coding\\APPLY_AIRLINE\\AirFrance\\drafts
@@ -27,13 +41,18 @@ Flow (never submits - stops on the review page for manual checking):
 2. Fill BookingRef, FirstName, LastName. Click Search.
 3. Select FlightNumber from radio list. Click Continue.
 4. Click 'Flight disruptions and missed connections'.
-5. If Status=Delay click 'Flight delayed'; if Status=Cancel click 'Flight canceled'.
+5. If Status=Delay click 'Flight delayed';
+   if Status=Cancel click 'Flight canceled';
+   if Status=MissConn click 'Missed connection'.
 6. Step 1: Compensation method = Cash. Accept Terms of Use. Continue.
 7. Step 2 (Expenses incurred):
    - Click 'No' radio for additional expenses.
    - Click 'Drop your files here or browse files on your computer' and
      attach every file path listed in the CSV "Files" column.
-   - Fill context textbox with DisruptionReason.
+   - Fill context textbox with the reason string derived from Status:
+       Delay     -> DELAY_REASON
+       Cancel    -> CANCEL_REASON
+       MissConn  -> MISSCONN_REASON
    - Continue.
 8. Step 3: Personal info (all values from CSV):
    - Title combobox = Title
@@ -67,8 +86,15 @@ Required CSV columns (ALL must be present in the CSV — no hardcoded defaults):
     FromAirport, ToAirport, Status,
     Title, Email, Phone, PhoneCountryCode, HomeCountry, Address, City,
     BankCountry, BankCity, BankAddress, BankName, BIC, IBAN,
-    AccountHolder, DisruptionReason,
-    Files   (pipe-separated list of absolute file paths to attach on Step 2)
+    AccountHolder,
+    Files   (one or more file or folder paths, separated by "|".
+             If a folder is given, every file inside it (recursively)
+             is attached on Step 2)
+
+Status column accepted values:
+    Delay     -> selects 'Flight delayed' sub-category, fills DELAY_REASON
+    Cancel    -> selects 'Flight canceled' sub-category, fills CANCEL_REASON
+    MissConn  -> selects 'Missed connection' sub-category, fills MISSCONN_REASON
 
 The script will refuse to run if any required column is missing or empty.
 """
@@ -143,6 +169,50 @@ CHROME_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# --------------------------------------------------------------------------- #
+# Disruption reason strings — selected based on the CSV "Status" column.
+# --------------------------------------------------------------------------- #
+# The wizard Step 2 (Expenses incurred) asks the passenger to describe what
+# happened. Instead of reading this free-text from the CSV, we use a fixed
+# reason string based on the flight's Status value:
+#
+#   Status=Delay     -> DELAY_REASON
+#   Status=Cancel    -> CANCEL_REASON
+#   Status=MissConn  -> MISSCONN_REASON
+#
+# This keeps the wording consistent across all submissions and matches the
+# sub-category selected on Step 5 (where Delay -> "Flight delayed",
+# Cancel -> "Flight canceled", MissConn -> "Missed connection").
+DELAY_REASON = "Flight was delayed by over 3 hours causing inconvenience to travel plans."
+CANCEL_REASON = "Cancellation caused significant inconvenience to my travel plans."
+MISSCONN_REASON = "Connecting flight was missed because of late arrival."
+
+
+def get_reason_for_status(status: str) -> str:
+    """Return the disruption-reason string that corresponds to a Status value.
+
+    Matching is case-insensitive and prefix-based:
+      - "delay", "delayed"               -> DELAY_REASON
+      - "cancel", "canceled", "cancelled" -> CANCEL_REASON
+      - "missconn", "missedconn", "missed connection"
+                                         -> MISSCONN_REASON
+
+    Raises ValueError if the Status value doesn't match any of the above
+    (this should never happen because step4_status already validates Status
+    earlier in the pipeline, but we re-check here to be defensive).
+    """
+    s = (status or "").strip().lower()
+    if s.startswith("delay"):
+        return DELAY_REASON
+    if s.startswith("cancel"):
+        return CANCEL_REASON
+    if s.startswith("missconn") or s.startswith("missedconn") or "missed connection" in s:
+        return MISSCONN_REASON
+    raise ValueError(
+        f"Unknown Status value: {status!r}. "
+        f"Expected one of: 'Delay', 'Cancel', 'MissConn'."
+    )
+
 # All data MUST come from the CSV. There are no hardcoded defaults.
 #
 # Every column the wizard needs is required — the script will refuse to run if any
@@ -158,26 +228,89 @@ REQUIRED_COLS = [
     # --- Bank details (wizard step 5) ---
     "BankCountry", "BankCity", "BankAddress", "BankName",
     "BIC", "IBAN", "AccountHolder",
-    # --- Free-text context (wizard step 2) ---
-    "DisruptionReason",
     # --- File attachments (wizard step 2) ---
-    # One or more absolute file paths, separated by the pipe character "|".
-    # Example:  C:\path\to\file1.pdf|C:\path\to\file2.pdf
+    # One or more absolute file OR folder paths, separated by "|".
+    # If an entry is a folder, every file inside it (recursively) is attached.
+    # Example:  C:\path\to\folder1|C:\path\to\file.pdf
     "Files",
+    # NOTE: The disruption-reason free-text is NOT read from the CSV.
+    # It is derived from the Status column via get_reason_for_status():
+    #   Status=Delay     -> DELAY_REASON
+    #   Status=Cancel    -> CANCEL_REASON
+    #   Status=MissConn  -> MISSCONN_REASON
 ]
 
 
 def parse_file_paths(raw: str) -> list[str]:
     """Parse the 'Files' CSV cell into a list of file paths.
 
-    Multiple file paths are separated by the pipe character "|".
+    Each entry in the cell (separated by the pipe character "|") may be either:
+      - a single file path, OR
+      - a folder path — in which case EVERY file inside that folder
+        (recursively, including sub-folders) is added to the upload list.
+
+    This lets the user point at e.g. "C:\\Coding\\APPLY_AIRLINE\\AirFrance\\files"
+    and have the script attach every document in that folder automatically.
+
     Empty / whitespace-only entries are dropped. Backslashes are preserved
     (Windows paths). Surrounding quotes are stripped.
+
+    NOTE: This function does NOT require the path to exist on disk — that is
+    checked separately by validate_row(). This is so the CSV can be authored
+    on a different OS than the one running the script (e.g. Linux preview,
+    Windows production). When the script actually runs on the target machine,
+    the folder/file expansion happens at upload time, not at CSV-parse time.
     """
     if not raw:
         return []
     parts = [p.strip().strip('"').strip("'") for p in raw.split("|")]
     return [p for p in parts if p]
+
+
+def expand_paths_to_files(paths: list[str]) -> list[str]:
+    """Expand each path in `paths` into a flat list of concrete file paths.
+
+    For each entry:
+      - if it's a directory, recursively walk it and add every file inside.
+      - if it's a regular file, add it directly.
+      - if it doesn't exist on this machine, add it verbatim (the caller is
+        responsible for warning — see validate_row()). On the target machine
+        it may exist as a folder or a file at upload time.
+
+    Returns a de-duplicated list (preserving first-seen order).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        try:
+            path = Path(p)
+        except Exception:
+            # Malformed path - keep it verbatim so the caller can warn.
+            if p not in seen:
+                out.append(p)
+                seen.add(p)
+            continue
+
+        if path.is_dir():
+            # Recursively walk the folder and add every file inside.
+            try:
+                for child in sorted(path.rglob("*")):
+                    if child.is_file():
+                        sp = str(child)
+                        if sp not in seen:
+                            out.append(sp)
+                            seen.add(sp)
+            except Exception:
+                # Permission error etc. — fall through and add the path verbatim.
+                if p not in seen:
+                    out.append(p)
+                    seen.add(p)
+        else:
+            # Regular file OR a path that doesn't exist on this machine.
+            if p not in seen:
+                out.append(p)
+                seen.add(p)
+    return out
 
 
 def validate_row(row: dict) -> dict:
@@ -188,10 +321,15 @@ def validate_row(row: dict) -> dict:
     exactly which column is missing or empty. This guarantees the form is filled
     with the values from the CSV and nothing else.
 
-    Also checks that every file path listed in the "Files" column exists on disk.
-    Missing files produce a WARNING (not a hard error) — this lets the script
-    run cross-platform (e.g. CSV edited on Linux but files live on Windows) and
-    lets Playwright's own error handling report the precise upload failure.
+    The "Files" column may contain:
+      - one or more file paths separated by "|", OR
+      - one or more folder paths separated by "|" — every file in those folders
+        (recursively) will be attached at upload time.
+
+    Missing files / folders produce a WARNING (not a hard error) — this lets
+    the script run cross-platform (e.g. CSV edited on Linux but files live on
+    Windows) and lets Playwright's own error handling report the precise
+    upload failure if the path truly doesn't exist on the target machine.
     """
     missing = [c for c in REQUIRED_COLS if not (row.get(c) or "").strip()]
     if missing:
@@ -200,25 +338,28 @@ def validate_row(row: dict) -> dict:
             f"required values for columns: {', '.join(missing)}"
         )
 
-    # Check that every file listed in the "Files" column actually exists on disk.
-    # WARNING only — not a hard error. The CSV may be authored on a different OS
-    # than the one running the script (e.g. Linux preview, Windows production).
-    # Playwright's set_input_files() will raise a clear error at upload time if
-    # a file truly doesn't exist.
+    # Validate that every entry in the "Files" column points to a file or folder
+    # that exists on disk. WARNING only — not a hard error. The CSV may be
+    # authored on a different OS than the one running the script.
     file_paths = parse_file_paths(row.get("Files", ""))
     if not file_paths:
         raise ValueError(
             f"Row for BookingRef={row.get('BookingRef') or '(unknown)'}: "
-            f"the 'Files' column is empty. Provide at least one file path "
+            f"the 'Files' column is empty. Provide at least one file or folder path "
             f"(multiple paths separated by '|')."
         )
-    missing_files = [p for p in file_paths if not Path(p).is_file()]
-    if missing_files:
-        print(f"  WARNING: the following file(s) listed in the 'Files' column do not")
+    missing_paths = []
+    for p in file_paths:
+        path = Path(p)
+        if not path.exists():
+            missing_paths.append(p)
+    if missing_paths:
+        print(f"  WARNING: the following path(s) listed in the 'Files' column do not")
         print(f"  exist on this machine (this is OK if you are testing on a different OS):")
-        for p in missing_files:
-            print(f"    - {p}")
-        print(f"  Playwright will retry the upload at runtime; if the file truly is")
+        for p in missing_paths:
+            kind = "folder" if (p.endswith("\\") or p.endswith("/") or "files" in p.lower()) else "path"
+            print(f"    - [{kind}] {p}")
+        print(f"  The script will attempt the upload at runtime; if the path truly is")
         print(f"  missing on the target machine, the upload step will report the error.")
     return dict(row)
 
@@ -953,15 +1094,27 @@ def step3_disruption_type(frame, page: Page):
 
 
 def step4_status(frame, page: Page, row: dict):
-    """Click 'Flight delayed' or 'Flight canceled' based on the CSV Status value."""
+    """Click the flight-status sub-category based on the CSV Status value.
+
+    Status=Delay     -> 'Flight delayed'
+    Status=Cancel    -> 'Flight canceled' (matches canceled / cancelled)
+    Status=MissConn  -> 'Missed connection' (also matches 'Missed connecting flight')
+    """
     status = (row.get("Status") or "").strip().lower()
     print(f"  [Step 5] Status = {status!r}")
     if status.startswith("delay"):
         target = r"flight ?delayed"
     elif status.startswith("cancel"):
         target = r"flight ?cancell?ed"  # matches both 'canceled' and 'cancelled'
+    elif status.startswith("missconn") or status.startswith("missedconn") or "missed connection" in status:
+        # Air France uses 'Missed connection' (or 'Missed connecting flight')
+        # as the third sub-category under 'Flight disruptions and missed connections'.
+        target = r"missed ?connection|missed connecting flight"
     else:
-        raise RuntimeError(f"Unknown Status value: {row.get('Status')!r} (use Delay or Cancel)")
+        raise RuntimeError(
+            f"Unknown Status value: {row.get('Status')!r} "
+            f"(use one of: Delay, Cancel, MissConn)"
+        )
 
     # Try clicking the SELECT button whose aria-label matches the target sub-category
     clicked = False
@@ -1094,11 +1247,34 @@ def wizard_step2_expenses(frame, page: Page, row: dict):
     #   2. If that fails, click the drop zone and respond to the resulting
     #      OS file-chooser via page.expect_file_chooser().
     # We pass ALL files at once (Playwright supports a list for <input multiple>).
-    file_paths = parse_file_paths(row.get("Files", ""))
-    if file_paths:
-        print(f"  Attaching {len(file_paths)} file(s) from CSV 'Files' column:")
+    #
+    # The CSV 'Files' column may contain one or more file OR folder paths,
+    # separated by "|". If a folder path is given, every file inside that folder
+    # (recursively) is attached.
+    raw_paths = parse_file_paths(row.get("Files", ""))
+    if raw_paths:
+        # Show what was specified in the CSV first (so the user sees their input).
+        print(f"  Files column entries ({len(raw_paths)}):")
+        for p in raw_paths:
+            kind = "folder" if Path(p).is_dir() else ("file" if Path(p).is_file() else "path (not found locally)")
+            print(f"    - [{kind}] {p}")
+
+        # Expand folder paths into the list of concrete files inside them.
+        file_paths = expand_paths_to_files(raw_paths)
+        if not file_paths:
+            # All entries were folders that don't exist on this machine OR
+            # folders that contain zero files. On the target machine they may
+            # resolve to actual files. Pass the raw paths through so Playwright
+            # can try them at upload time (it will error clearly if invalid).
+            print(f"  ! Could not expand any entry to a concrete file on this machine.")
+            print(f"    Passing the raw paths to Playwright; the upload step will")
+            print(f"    report a clear error if they don't resolve on the target machine.")
+            file_paths = list(raw_paths)
+
+        print(f"  Uploading {len(file_paths)} file(s) in total:")
         for p in file_paths:
             print(f"    - {p}")
+
         uploaded = upload_files_to_dropzone(
             frame, page, file_paths,
             dropzone_patterns=[
@@ -1123,11 +1299,24 @@ def wizard_step2_expenses(frame, page: Page, row: dict):
         # validate_row() already rejected empty Files, but be defensive.
         print("  ! 'Files' column is empty - skipping file upload.")
 
-    # Fill the context textbox with the DisruptionReason value from the CSV.
-    # (DisruptionReason is now a required CSV column, so it should never be empty.)
-    context = (row.get("DisruptionReason") or "").strip()
-    if not context:
-        print("  ! DisruptionReason is empty in the CSV - the context textbox will be left blank")
+    # Fill the context textbox with the disruption-reason string that
+    # corresponds to the CSV "Status" column.
+    #   Status=Delay     -> DELAY_REASON
+    #   Status=Cancel    -> CANCEL_REASON
+    #   Status=MissConn  -> MISSCONN_REASON
+    status_value = (row.get("Status") or "").strip()
+    try:
+        context = get_reason_for_status(status_value)
+    except ValueError as e:
+        # Should not happen because step4_status validates Status earlier,
+        # but be defensive — fall back to an empty string and continue.
+        print(f"  ! Could not derive reason from Status={status_value!r}: {e}")
+        context = ""
+    if context:
+        print(f"  Using reason for Status={status_value!r}: {context[:60]}"
+              f"{'...' if len(context) > 60 else ''}")
+    else:
+        print("  ! Context is empty - the textbox will be left blank")
 
     context_filled = fill_field(
         frame,
