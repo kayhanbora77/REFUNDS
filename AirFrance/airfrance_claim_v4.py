@@ -79,8 +79,8 @@ from playwright.sync_api import (
 # Configuration
 # --------------------------------------------------------------------------- #
 CLAIM_URL = "https://wwws.airfrance.ca/en/claim"
-DEFAULT_CSV = r"C:\Coding\REFUNDS\AirFrance\info.csv"
-DEFAULT_DRAFTS_DIR = r"C:\Coding\REFUNDS\AirFrance\drafts"
+DEFAULT_CSV = r"C:\Coding\APPLY_AIRLINE\AirFrance\info.csv"
+DEFAULT_DRAFTS_DIR = r"C:\Coding\APPLY_AIRLINE\AirFrance\drafts"
 TIMEOUT = 25_000
 
 # ---- TIMING MODES (the biggest time-saver) ----
@@ -125,17 +125,12 @@ CHROME_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Mock data defaults (only used when CSV doesn't provide the field)
-MOCK_FIRST_NAMES = ["Alex", "Jordan", "Taylor", "Casey", "Morgan", "Riley", "Sam", "Jamie"]
-MOCK_LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis"]
-MOCK_BANK_CITIES = ["Istanbul", "Ankara", "Izmir"]
-MOCK_STREETS = ["Istiklal Street", "Ataturk Boulevard", "Bagdat Avenue"]
-MOCK_REASONS = [
-    "Flight was delayed by over 3 hours causing inconvenience to travel plans.",
-    "Connecting flight was missed because of late arrival.",
-    "Cancellation caused significant inconvenience to my travel plans.",
-]
-REQUIRED_COLS = {"BookingRef", "FirstName", "LastName", "FlightNumber", "Status"}
+CANCEL_REASON="Cancellation caused significant inconvenience to my travel plans."
+DELAY_REASON="Flight was delayed by over 3 hours causing inconvenience to travel plans."
+MISSCONN_REASON="Connecting flight was missed because of late arrival."
+
+REQUIRED_COLS = {"BookingRef", "FirstName", "LastName", "FlightNumber","DepartureDate","FromAirport","ToAirport", 
+"BankCountry", "BankCity", "BankAddress",  "IBAN", "Title", "HomeCountry","PhoneCountryCode","Email","Status"}
 
 # Default values for the wizard steps (when CSV doesn't override)
 DEFAULT_TITLE = "Mr."
