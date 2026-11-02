@@ -1,13 +1,15 @@
 """
 Gmail -> Dropbox -> Word pipeline
 
-1. Connect to Gmail (kayhanboraisteps@gmail.com)
-2. Find the LAST email from SENDER_EMAIL that has a PDF attachment named
+1. Connect to Gmail (the mailbox that owns credentials.json / token.json)
+2. Read the sender e-mail address from the "Email" column of info.csv
+   (no address is hardcoded in this script any more)
+3. Find the LAST email from that address with a PDF attachment named
    Assignment_Form_<CASE_ID>_<first>_<last>.pdf
    (e.g. Assignment_Form_533439_olga_kagan.pdf -> CASE_ID = 533439)
-3. Create folder  Agency Data\\Claims\\<CASE_ID>.<Firstname Lastname>
-4. Download ALL attachments of that email into the folder
-5. Copy letter_template.docx into the folder, replacing "XXX" with the
+4. Create folder  Agency Data\\Claims\\<CASE_ID>.<Firstname Lastname>
+5. Download ALL attachments of that email into the folder
+6. Copy letter_template.docx into the folder, replacing "XXX" with the
    sender's first name and last name.
 
 Install:
@@ -16,11 +18,16 @@ Install:
 Setup:
     - Gmail API enabled in Google Cloud Console, OAuth client (Desktop app)
       saved as credentials.json.
+    - info.csv must contain an "Email" column (the sender address). By default
+      it is looked up next to this script, in the sibling AirFrancePipeLine
+      folder and at INFO_CSV below.
     - First run opens a browser for consent and stores token.json
       (next to this script). If you change SCOPES, delete token.json.
 """
 
 import base64
+import csv
+import io
 import json
 import os
 import re
@@ -39,7 +46,17 @@ from googleapiclient.discovery import build
 # ----------------------------------------------------------------------------
 # CONFIG - edit these
 # ----------------------------------------------------------------------------
-SENDER_EMAIL = "kayhanboraisteps@gmail.com"
+# SENDER_EMAIL is no longer hardcoded here: it is read from the "Email"
+# column of this CSV at start-up (see load_sender_emails).
+INFO_CSV = Path(r"C:\Coding\APPLY_AIRLINE\AirFrancePipeLine\info.csv")
+
+# Optional: exact column name to read the address from.
+# Empty = auto-detect any column whose name contains "email".
+EMAIL_COLUMN = ""
+
+# Optional manual override (e.g. the Gmail account that owns the mailbox).
+# Empty = use the address found in info.csv.
+SENDER_EMAIL_OVERRIDE = ""
 
 # Local folder synced with https://www.dropbox.com/home/Agency%20Data/Claims
 # Leave as None to auto-detect from the Dropbox desktop app on THIS computer.
@@ -73,16 +90,134 @@ DROPBOX_APP_KEY = "94aa13slcrac8zt"
 DROPBOX_REMOTE_CLAIMS = "/Agency Data/Claims"      # = dropbox.com/home/Agency Data/Claims
 DROPBOX_TOKEN_FILE = Path(__file__).resolve().parent / "dropbox_token.json"
 
-# Narrow Gmail search; exact filename check is done in code
-GMAIL_QUERY = f"from:{SENDER_EMAIL} has:attachment filename:pdf"
-
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# A cell that looks like an e-mail address
+EMAIL_VALUE_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[A-Za-z]{2,}$")
+
+
+# ----------------------------------------------------------------------------
+# info.csv -> sender e-mail
+# ----------------------------------------------------------------------------
+def resolve_info_csv() -> Path:
+    """Find info.csv: the configured path first, then the usual neighbours."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        Path(INFO_CSV) if INFO_CSV else None,
+        here / "info.csv",
+        here.parent / "AirFrancePipeLine" / "info.csv",
+        Path.cwd() / "info.csv",
+    ]
+    for c in candidates:
+        if c and c.is_file():
+            return c
+    tried = "\n  ".join(str(c) for c in candidates if c)
+    raise SystemExit(
+        f"info.csv not found. Looked at:\n  {tried}\n"
+        f"Set INFO_CSV to the file that holds the 'Email' column."
+    )
+
+
+def find_email_column(header: list[str]) -> str | None:
+    """Return the header cell that holds the e-mail address (or None)."""
+    if EMAIL_COLUMN:
+        for h in header:
+            if h and h.strip().lower() == EMAIL_COLUMN.strip().lower():
+                return h
+        return None
+
+    norm: dict[str, str] = {}
+    for h in header:
+        if not h:
+            continue
+        key = re.sub(r"[^a-z0-9]", "", h.strip().lower())
+        if key and key not in norm:
+            norm[key] = h
+
+    for key in ("email", "emailaddress", "eaddress", "mail", "contactemail"):
+        if key in norm:
+            return norm[key]
+    for key, h in norm.items():
+        if "email" in key:
+            return h
+    return None
+
+
+def sniff_delimiter(text: str) -> str:
+    """Pick the delimiter that splits every header line into the same columns."""
+    lines = [ln for ln in text.splitlines() if ln.strip()][:10]
+    best, best_cols = ",", 0
+    for d in (",", ";", "\t", "|"):
+        counts = {len(next(csv.reader([ln], delimiter=d))) for ln in lines}
+        if len(counts) != 1:
+            continue
+        cols = counts.pop()
+        if cols < 2:
+            continue
+        if cols > best_cols:          # first delimiter wins a tie
+            best, best_cols = d, cols
+    return best
+
+
+def read_csv_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    """Return (header, data rows). The header is the first row that has an
+    e-mail column, so a few junk lines above the table are tolerated."""
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    delimiter = sniff_delimiter(text)
+    rows = [r for r in csv.reader(io.StringIO(text), delimiter=delimiter)]
+    rows = [r for r in rows if any((c or "").strip() for c in r)]
+    if not rows:
+        raise SystemExit(f"{path} is empty.")
+
+    for i, row in enumerate(rows[:5]):
+        if find_email_column(row):
+            return row, rows[i + 1:]
+    return rows[0], rows[1:]          # no e-mail column -> caller reports it
+
+
+def load_sender_emails() -> list[str]:
+    """Read the sender e-mail address(es) from the 'Email' column of info.csv."""
+    path = resolve_info_csv()
+    header, rows = read_csv_table(path)
+
+    col = find_email_column(header)
+    if col is None:
+        msg = f"No 'Email' column found in {path}. Columns: {header}"
+        if EMAIL_COLUMN:
+            msg += f"\nEMAIL_COLUMN is set to {EMAIL_COLUMN!r} - is that the column?"
+        raise SystemExit(msg)
+
+    idx = header.index(col)
+    emails: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw = (row[idx] if idx < len(row) else "").strip()
+        if not raw or raw.lower() in {"nan", "none", "null", "-", "n/a"}:
+            continue
+        for addr in re.split(r"[;,|]", raw):
+            addr = addr.strip()
+            if EMAIL_VALUE_RE.match(addr) and addr.lower() not in seen:
+                seen.add(addr.lower())
+                emails.append(addr)
+
+    if not emails:
+        raise SystemExit(
+            f"No valid e-mail address in column {col!r} of {path}."
+        )
+    return emails
+
+
+def build_gmail_query(emails: list[str]) -> str:
+    """Search mail from every address in the 'Email' column (Gmail braces = OR)."""
+    if len(emails) == 1:
+        return f"from:{emails[0]} has:attachment filename:pdf"
+    return "{" + " ".join(f"from:{e}" for e in emails) + "} has:attachment filename:pdf"
 
 
 # ----------------------------------------------------------------------------
 # Gmail
 # ----------------------------------------------------------------------------
-def get_gmail_service():
+def get_gmail_service(login_hint: str = ""):
     creds = None
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
@@ -96,12 +231,12 @@ def get_gmail_service():
                 print(f"Token refresh failed ({exc}); signing in again")
         if not refreshed:
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # login_hint pre-selects SENDER_EMAIL, so Google skips the
+            # login_hint pre-selects the account, so Google skips the
             # "choose an account" screen. prompt="consent" is not forced, so
             # after the first sign-in nothing is asked again.
             creds = flow.run_local_server(
                 port=0,
-                login_hint=SENDER_EMAIL,
+                login_hint=login_hint,
                 authorization_prompt_message="",
                 success_message="Signed in. You can close this tab.",
             )
@@ -412,12 +547,26 @@ def build_letter(template: Path, output: Path, replacements: dict[str, str]):
 # ----------------------------------------------------------------------------
 def run() -> dict:
     """Gmail -> local/Dropbox folder -> letter. Returns info for the next stage."""
-    service = get_gmail_service()
-    print(f"Connected to Gmail as {SENDER_EMAIL}")
+    # Sender address(es) come from the 'Email' column of info.csv
+    emails = load_sender_emails()
+    override = SENDER_EMAIL_OVERRIDE.strip()
+    sender_email = override or emails[0]
+    search_emails = [sender_email] if override else emails
+    print(f"Sender e-mail from info.csv: {', '.join(search_emails)}")
+
+    service = get_gmail_service(login_hint=sender_email)
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        mailbox = profile.get("emailAddress", "?")
+    except Exception:
+        mailbox = "?"
+    print(f"Connected to Gmail as {mailbox}")
 
     # Newest first -> first message with a matching Assignment_Form PDF wins
     msg = case_id = fname_owner = None
-    for mid in list_message_ids(service, GMAIL_QUERY):
+    query = build_gmail_query(search_emails)
+    print(f"Gmail query: {query}")
+    for mid in list_message_ids(service, query):
         candidate = service.users().messages().get(
             userId="me", id=mid, format="full"
         ).execute()
@@ -427,7 +576,10 @@ def run() -> dict:
             case_id, fname_owner = found
             break
     if msg is None:
-        sys.exit(f"No email from {SENDER_EMAIL} with an Assignment_Form_*.pdf attachment")
+        sys.exit(
+            f"No email from {', '.join(search_emails)} "
+            f"with an Assignment_Form_*.pdf attachment"
+        )
 
     owner = fname_owner if NAME_SOURCE == "filename" else owner_name_from_header(msg)
     print(f"Email: {header(msg, 'Subject')!r}  case={case_id}  owner={owner}")
@@ -464,6 +616,7 @@ def run() -> dict:
         "folder": folder,                       # local folder holding everything
         "case_id": case_id,
         "owner": owner,
+        "sender_email": sender_email,           # from the 'Email' column of info.csv
         # sender name + the passenger names inside every Assignment_Form_*.pdf file name
         "names": [fname_owner, owner_name_from_header(msg)] + [
             nice_name(m.group(2))
