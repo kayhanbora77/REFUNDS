@@ -1,0 +1,2 @@
+BookingRef,FirstName,LastName,FlightNumber,DepartureDate,FromAirport,ToAirport,Status,Title,Email,Phone,PhoneCountryCode,HomeCountry,Address,City,BankCountry,BankCity,BankAddress,BankName,BIC,IBAN,AccountHolder,Files
+Z7BD5A,AVRAJ,SINGH,AF1687,10/1/2026,EDI,CDG,Delay,Mr.,avraj.singh@gmail.com,5551234567,Turkey (+90),Turkey,"123 Istiklal Street, Istanbul",Istanbul,Turkey,Istanbul,123 Istiklal Street,Global Mock Banking Corp,AKBKTR2AXXX,TR32001000999991123456,AVRAJ SINGH,C:\Coding\APPLY_AIRLINE\AirFrance\files
