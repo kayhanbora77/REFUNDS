@@ -1,0 +1,636 @@
+"""
+Gmail -> Dropbox -> Word pipeline
+
+1. Connect to Gmail (the mailbox that owns credentials.json / token.json)
+2. Read the sender e-mail address from the "Email" column of info.csv
+   (no address is hardcoded in this script any more)
+3. Find the LAST email from that address with a PDF attachment named
+   Assignment_Form_<CASE_ID>_<first>_<last>.pdf
+   (e.g. Assignment_Form_533439_olga_kagan.pdf -> CASE_ID = 533439)
+4. Create folder  Agency Data\\Claims\\<CASE_ID>.<Firstname Lastname>
+5. Download ALL attachments of that email into the folder
+6. Copy letter_template.docx into the folder, replacing "XXX" with the
+   sender's first name and last name.
+
+Install:
+    pip install google-api-python-client google-auth-oauthlib google-auth-httplib2 python-docx
+
+Setup:
+    - Gmail API enabled in Google Cloud Console, OAuth client (Desktop app)
+      saved as credentials.json.
+    - info.csv must contain an "Email" column (the sender address). By default
+      it is looked up next to this script, in the sibling AirFrancePipeLine
+      folder and at INFO_CSV below.
+    - First run opens a browser for consent and stores token.json
+      (next to this script). If you change SCOPES, delete token.json.
+"""
+
+import base64
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from email.utils import parseaddr
+from pathlib import Path
+
+from docx import Document
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# ----------------------------------------------------------------------------
+# CONFIG - edit these
+# ----------------------------------------------------------------------------
+# SENDER_EMAIL is no longer hardcoded here: it is read from the "Email"
+# column of this CSV at start-up (see load_sender_emails).
+INFO_CSV = Path(r"C:\Coding\APPLY_AIRLINE\AirFrancePipeLine\info.csv")
+
+# Optional: exact column name to read the address from.
+# Empty = auto-detect any column whose name contains "email".
+EMAIL_COLUMN = ""
+
+# Optional manual override (e.g. the Gmail account that owns the mailbox).
+# Empty = use the address found in info.csv.
+SENDER_EMAIL_OVERRIDE = ""
+
+# Local folder synced with https://www.dropbox.com/home/Agency%20Data/Claims
+# Leave as None to auto-detect from the Dropbox desktop app on THIS computer.
+# Or set it by hand, e.g. Path(r"C:\Users\cagri\Dropbox\Agency Data\Claims")
+DROPBOX_CLAIMS: Path | None = None
+
+TEMPLATE_DOCX = Path(r"C:\Coding\APPLY_AIRLINE\AirFrancePipeLine\letter_template.docx")
+CREDENTIALS_FILE = Path(r"C:\Coding\APPLY_AIRLINE\AirFrancePipeLine\credentials.json")
+TOKEN_FILE = Path(__file__).resolve().parent / "token.json"
+
+# Text in the Word template to replace with "Firstname Lastname"
+OLD_NAME = "XXX"
+
+# Optional extra replacements, e.g. {"A Airport-IataCode": "Istanbul Airport-IST"}
+EXTRA_REPLACEMENTS: dict[str, str] = {}
+
+# Name source for folder + letter:
+#   "header"   -> From: display name of the email (fallback: file name)
+#   "filename" -> name inside the attachment file name (olga_kagan -> Olga Kagan)
+NAME_SOURCE = "header"
+
+# Attachment file name pattern: Assignment_Form_<case id>_<name parts>.pdf
+FORM_RE = re.compile(r"^Assignment_Form_(\d+)_(.+)\.pdf$", re.IGNORECASE)
+
+# --- Dropbox over the internet (used when there is no synced folder) --------
+# One-time setup: https://www.dropbox.com/developers/apps -> Create app ->
+#   "Scoped access" -> "Full Dropbox" -> Permissions tab: tick
+#   files.content.write + files.content.read (+ sharing.read if needed) -> Submit.
+# Copy the "App key" here (no secret needed). First run asks you to approve once.
+DROPBOX_APP_KEY = "94aa13slcrac8zt"
+DROPBOX_REMOTE_CLAIMS = "/Agency Data/Claims"      # = dropbox.com/home/Agency Data/Claims
+DROPBOX_TOKEN_FILE = Path(__file__).resolve().parent / "dropbox_token.json"
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# A cell that looks like an e-mail address
+EMAIL_VALUE_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[A-Za-z]{2,}$")
+
+
+# ----------------------------------------------------------------------------
+# info.csv -> sender e-mail
+# ----------------------------------------------------------------------------
+def resolve_info_csv() -> Path:
+    """Find info.csv: the configured path first, then the usual neighbours."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        Path(INFO_CSV) if INFO_CSV else None,
+        here / "info.csv",
+        here.parent / "AirFrancePipeLine" / "info.csv",
+        Path.cwd() / "info.csv",
+    ]
+    for c in candidates:
+        if c and c.is_file():
+            return c
+    tried = "\n  ".join(str(c) for c in candidates if c)
+    raise SystemExit(
+        f"info.csv not found. Looked at:\n  {tried}\n"
+        f"Set INFO_CSV to the file that holds the 'Email' column."
+    )
+
+
+def find_email_column(header: list[str]) -> str | None:
+    """Return the header cell that holds the e-mail address (or None)."""
+    if EMAIL_COLUMN:
+        for h in header:
+            if h and h.strip().lower() == EMAIL_COLUMN.strip().lower():
+                return h
+        return None
+
+    norm: dict[str, str] = {}
+    for h in header:
+        if not h:
+            continue
+        key = re.sub(r"[^a-z0-9]", "", h.strip().lower())
+        if key and key not in norm:
+            norm[key] = h
+
+    for key in ("email", "emailaddress", "eaddress", "mail", "contactemail"):
+        if key in norm:
+            return norm[key]
+    for key, h in norm.items():
+        if "email" in key:
+            return h
+    return None
+
+
+def sniff_delimiter(text: str) -> str:
+    """Pick the delimiter that splits every header line into the same columns."""
+    lines = [ln for ln in text.splitlines() if ln.strip()][:10]
+    best, best_cols = ",", 0
+    for d in (",", ";", "\t", "|"):
+        counts = {len(next(csv.reader([ln], delimiter=d))) for ln in lines}
+        if len(counts) != 1:
+            continue
+        cols = counts.pop()
+        if cols < 2:
+            continue
+        if cols > best_cols:          # first delimiter wins a tie
+            best, best_cols = d, cols
+    return best
+
+
+def read_csv_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    """Return (header, data rows). The header is the first row that has an
+    e-mail column, so a few junk lines above the table are tolerated."""
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    delimiter = sniff_delimiter(text)
+    rows = [r for r in csv.reader(io.StringIO(text), delimiter=delimiter)]
+    rows = [r for r in rows if any((c or "").strip() for c in r)]
+    if not rows:
+        raise SystemExit(f"{path} is empty.")
+
+    for i, row in enumerate(rows[:5]):
+        if find_email_column(row):
+            return row, rows[i + 1:]
+    return rows[0], rows[1:]          # no e-mail column -> caller reports it
+
+
+def load_sender_emails() -> list[str]:
+    """Read the sender e-mail address(es) from the 'Email' column of info.csv."""
+    path = resolve_info_csv()
+    header, rows = read_csv_table(path)
+
+    col = find_email_column(header)
+    if col is None:
+        msg = f"No 'Email' column found in {path}. Columns: {header}"
+        if EMAIL_COLUMN:
+            msg += f"\nEMAIL_COLUMN is set to {EMAIL_COLUMN!r} - is that the column?"
+        raise SystemExit(msg)
+
+    idx = header.index(col)
+    emails: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw = (row[idx] if idx < len(row) else "").strip()
+        if not raw or raw.lower() in {"nan", "none", "null", "-", "n/a"}:
+            continue
+        for addr in re.split(r"[;,|]", raw):
+            addr = addr.strip()
+            if EMAIL_VALUE_RE.match(addr) and addr.lower() not in seen:
+                seen.add(addr.lower())
+                emails.append(addr)
+
+    if not emails:
+        raise SystemExit(
+            f"No valid e-mail address in column {col!r} of {path}."
+        )
+    return emails
+
+
+def build_gmail_query(emails: list[str]) -> str:
+    """Search mail from every address in the 'Email' column (Gmail braces = OR)."""
+    if len(emails) == 1:
+        return f"from:{emails[0]} has:attachment filename:pdf"
+    return "{" + " ".join(f"from:{e}" for e in emails) + "} has:attachment filename:pdf"
+
+
+# ----------------------------------------------------------------------------
+# Gmail
+# ----------------------------------------------------------------------------
+def get_gmail_service(login_hint: str = ""):
+    creds = None
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if not creds or not creds.valid:
+        refreshed = False
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                refreshed = True
+            except Exception as exc:  # revoked/expired refresh token
+                print(f"Token refresh failed ({exc}); signing in again")
+        if not refreshed:
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+            # login_hint pre-selects the account, so Google skips the
+            # "choose an account" screen. prompt="consent" is not forced, so
+            # after the first sign-in nothing is asked again.
+            creds = flow.run_local_server(
+                port=0,
+                login_hint=login_hint,
+                authorization_prompt_message="",
+                success_message="Signed in. You can close this tab.",
+            )
+        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    return build("gmail", "v1", credentials=creds)
+
+
+def list_message_ids(service, query):
+    """Message ids, newest first (Gmail's default order)."""
+    page_token = None
+    while True:
+        resp = service.users().messages().list(
+            userId="me", q=query, pageToken=page_token
+        ).execute()
+        for m in resp.get("messages", []):
+            yield m["id"]
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            return
+
+
+def header(msg, name):
+    for h in msg["payload"].get("headers", []):
+        if h["name"].lower() == name.lower():
+            return h["value"]
+    return ""
+
+
+def iter_attachment_parts(payload):
+    body = payload.get("body", {})
+    if payload.get("filename") and (body.get("attachmentId") or body.get("data")):
+        yield payload
+    for part in payload.get("parts", []) or []:
+        yield from iter_attachment_parts(part)
+
+
+def find_assignment_form(msg):
+    """Return (case_id, name_from_filename) if the message has the form PDF."""
+    for part in iter_attachment_parts(msg["payload"]):
+        m = FORM_RE.match(part["filename"])
+        if m:
+            return m.group(1), nice_name(m.group(2).replace("_", " "))
+    return None
+
+
+def nice_name(raw: str) -> str:
+    raw = re.sub(r"[._\-]+", " ", raw)
+    return " ".join(w.capitalize() for w in raw.split())
+
+
+def owner_name_from_header(msg):
+    display, addr = parseaddr(header(msg, "From"))
+    name = display.strip().strip('"')
+    if not name:
+        name = addr.split("@")[0]
+    return nice_name(name)
+
+
+def is_inline(part) -> bool:
+    """True for signature logos / embedded images (not real attachments)."""
+    hdrs = {h["name"].lower(): h["value"] for h in part.get("headers", [])}
+    disp = hdrs.get("content-disposition", "").strip().lower()
+    if disp.startswith("attachment"):
+        return False
+    if disp.startswith("inline"):
+        return True
+    return part.get("mimeType", "").startswith("image/") and "content-id" in hdrs
+
+
+def download_attachments(service, msg, dest: Path):
+    saved = []
+    parts = list(iter_attachment_parts(msg["payload"]))
+    print(f"  email has {len(parts)} file part(s):")
+    for part in parts:
+        hdrs = {h["name"].lower(): h["value"] for h in part.get("headers", [])}
+        print(f"    - {part['filename']}  [{part.get('mimeType', '?')}]  "
+              f"disposition={hdrs.get('content-disposition', '-').split(';')[0]}")
+    for part in parts:
+        if is_inline(part):
+            print(f"  skipped inline image: {part['filename']}")
+            continue
+        body = part["body"]
+        if "attachmentId" in body:
+            att = service.users().messages().attachments().get(
+                userId="me", messageId=msg["id"], id=body["attachmentId"]
+            ).execute()
+            data = att["data"]
+        else:
+            data = body["data"]
+        raw = base64.urlsafe_b64decode(data.encode("utf-8"))
+
+        # Same name = overwrite, so re-running never piles up "(1)", "(2)" copies
+        target = dest / safe_filename(part["filename"])
+        target.write_bytes(raw)
+        saved.append(target)
+        print(f"  saved attachment: {target.name}")
+    return saved
+
+
+# ----------------------------------------------------------------------------
+# Filesystem helpers
+# ----------------------------------------------------------------------------
+def find_claims_folder() -> Path | None:
+    """Locate '<Dropbox>\\Agency Data\\Claims' on this computer, or None."""
+    if DROPBOX_CLAIMS is not None:
+        return DROPBOX_CLAIMS
+
+    roots = []
+    # The Dropbox desktop app records its sync folders (personal + business)
+    for env in ("LOCALAPPDATA", "APPDATA"):
+        info = Path(os.environ.get(env, "")) / "Dropbox" / "info.json"
+        if info.is_file():
+            try:
+                data = json.loads(info.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for acct in data.values():
+                if isinstance(acct, dict) and acct.get("path"):
+                    roots.append(Path(acct["path"]))
+    roots.append(Path.home() / "Dropbox")  # default location
+
+    for root in roots:
+        agency = root / "Agency Data"
+        if agency.is_dir():
+            return agency / "Claims"   # created below if missing
+
+    return None  # no synced Dropbox folder on this computer -> use the API
+
+
+def is_stale_copy(name: str, keep: set[str], case_id: str) -> bool:
+    """A file this script made on an earlier run that is not part of this run:
+      - 'x (1).pdf' / 'x (2).docx' copies of a current file
+      - Assignment_Form_<this case>_*.pdf from an older email
+      - '<Name> - letter_template*.docx' letters from an older run
+    Any other file in the folder is left alone."""
+    if name in keep:
+        return False
+    m = re.match(r"^(.*) \(\d+\)(\.[^.]+)?$", name)
+    if m and (m.group(1) + (m.group(2) or "")) in keep:
+        return True
+    fm = FORM_RE.match(name)
+    if fm and fm.group(1) == case_id:
+        return True
+    stem, suffix = TEMPLATE_DOCX.stem, TEMPLATE_DOCX.suffix
+    return bool(re.fullmatch(
+        rf".* - {re.escape(stem)}( \(\d+\))?{re.escape(suffix)}", name))
+
+
+def cleanup_local(folder: Path, keep: set[str], case_id: str):
+    for f in folder.iterdir():
+        if f.is_file() and is_stale_copy(f.name, keep, case_id):
+            try:
+                f.unlink()
+                print(f"  removed old duplicate: {f.name}")
+            except OSError as exc:
+                print(f"  could not remove {f.name}: {exc}")
+
+
+def cleanup_remote(dbx, remote_folder: str, keep: set[str], case_id: str):
+    import dropbox
+    try:
+        res = dbx.files_list_folder(remote_folder)
+        entries = list(res.entries)
+        while res.has_more:
+            res = dbx.files_list_folder_continue(res.cursor)
+            entries += res.entries
+        for e in entries:
+            if (isinstance(e, dropbox.files.FileMetadata)
+                    and is_stale_copy(e.name, keep, case_id)):
+                dbx.files_delete_v2(f"{remote_folder}/{e.name}")
+                print(f"  removed old duplicate on Dropbox: {e.name}")
+    except Exception as exc:
+        print(f"  (could not clean old duplicates on Dropbox: {exc})")
+
+
+def safe_filename(name: str) -> str:
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip() or "unnamed"
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    i = 1
+    while True:
+        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+# ----------------------------------------------------------------------------
+# Dropbox API upload
+# ----------------------------------------------------------------------------
+def get_dropbox_client():
+    import dropbox  # pip install dropbox
+    from dropbox import DropboxOAuth2FlowNoRedirect
+
+    if not DROPBOX_APP_KEY:
+        sys.exit(
+            "No synced Dropbox folder found on this computer, and DROPBOX_APP_KEY is empty.\n"
+            "Either install/sign in to the Dropbox desktop app and sync 'Agency Data',\n"
+            "or create a Dropbox app and paste its App key into DROPBOX_APP_KEY (see script top)."
+        )
+
+    if DROPBOX_TOKEN_FILE.exists():
+        refresh = json.loads(DROPBOX_TOKEN_FILE.read_text(encoding="utf-8"))["refresh_token"]
+    else:
+        flow = DropboxOAuth2FlowNoRedirect(
+            DROPBOX_APP_KEY, use_pkce=True, token_access_type="offline"
+        )
+        print("\n1. Open this URL, click Allow:\n  ", flow.start())
+        code = input("2. Paste the authorization code here: ").strip()
+        result = flow.finish(code)
+        refresh = result.refresh_token
+        DROPBOX_TOKEN_FILE.write_text(json.dumps({"refresh_token": refresh}), encoding="utf-8")
+
+    dbx = dropbox.Dropbox(oauth2_refresh_token=refresh, app_key=DROPBOX_APP_KEY)
+    # Make paths relative to the Dropbox root (needed for team accounts)
+    try:
+        root = dbx.users_get_current_account().root_info.root_namespace_id
+        dbx = dbx.with_path_root(dropbox.common.PathRoot.root(root))
+    except Exception:
+        pass
+    return dbx
+
+
+def upload_folder(dbx, local_folder: Path, remote_folder: str):
+    import dropbox
+
+    for f in sorted(local_folder.iterdir()):
+        if not f.is_file():
+            continue
+        remote = f"{remote_folder}/{f.name}"
+        size = f.stat().st_size
+        with open(f, "rb") as fh:
+            if size <= 100 * 1024 * 1024:
+                dbx.files_upload(fh.read(), remote, mode=dropbox.files.WriteMode.overwrite)
+            else:  # large files: chunked upload
+                chunk = 50 * 1024 * 1024
+                sess = dbx.files_upload_session_start(fh.read(chunk))
+                cursor = dropbox.files.UploadSessionCursor(sess.session_id, fh.tell())
+                commit = dropbox.files.CommitInfo(
+                    path=remote, mode=dropbox.files.WriteMode.overwrite)
+                while size - fh.tell() > chunk:
+                    dbx.files_upload_session_append_v2(fh.read(chunk), cursor)
+                    cursor.offset = fh.tell()
+                dbx.files_upload_session_finish(fh.read(chunk), cursor, commit)
+        print(f"  uploaded to Dropbox: {remote}")
+
+
+# ----------------------------------------------------------------------------
+# Word replacement
+# ----------------------------------------------------------------------------
+def replace_in_paragraph(paragraph, replacements: dict[str, str]):
+    """Replace text even when Word split it across several runs; keeps the
+    formatting of the run where the match starts."""
+    for old, new in replacements.items():
+        search_from = 0
+        while True:
+            runs = paragraph.runs
+            full = "".join(r.text for r in runs)
+            idx = full.find(old, search_from)
+            if idx == -1:
+                break
+            end = idx + len(old)
+            pos = 0
+            first = True
+            for r in runs:
+                r_start, r_end = pos, pos + len(r.text)
+                pos = r_end
+                if r_end <= idx or r_start >= end:
+                    continue
+                s = max(idx, r_start) - r_start
+                e = min(end, r_end) - r_start
+                if first:
+                    r.text = r.text[:s] + new + r.text[e:]
+                    first = False
+                else:
+                    r.text = r.text[:s] + r.text[e:]
+            search_from = idx + len(new)  # never re-scan the inserted text
+
+
+def iter_paragraphs(doc):
+    def from_container(container):
+        for p in container.paragraphs:
+            yield p
+        for table in getattr(container, "tables", []):
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from from_container(cell)
+
+    yield from from_container(doc)
+    for section in doc.sections:
+        for part in (section.header, section.footer,
+                     section.first_page_header, section.first_page_footer):
+            yield from from_container(part)
+
+
+def build_letter(template: Path, output: Path, replacements: dict[str, str]):
+    doc = Document(str(template))
+    for p in iter_paragraphs(doc):
+        replace_in_paragraph(p, replacements)
+    doc.save(str(output))
+
+
+# ----------------------------------------------------------------------------
+# Pipeline
+# ----------------------------------------------------------------------------
+def run() -> dict:
+    """Gmail -> local/Dropbox folder -> letter. Returns info for the next stage."""
+    # Sender address(es) come from the 'Email' column of info.csv
+    emails = load_sender_emails()
+    override = SENDER_EMAIL_OVERRIDE.strip()
+    sender_email = override or emails[0]
+    search_emails = [sender_email] if override else emails
+    print(f"Sender e-mail from info.csv: {', '.join(search_emails)}")
+
+    service = get_gmail_service(login_hint=sender_email)
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        mailbox = profile.get("emailAddress", "?")
+    except Exception:
+        mailbox = "?"
+    print(f"Connected to Gmail as {mailbox}")
+
+    # Newest first -> first message with a matching Assignment_Form PDF wins
+    msg = case_id = fname_owner = None
+    query = build_gmail_query(search_emails)
+    print(f"Gmail query: {query}")
+    for mid in list_message_ids(service, query):
+        candidate = service.users().messages().get(
+            userId="me", id=mid, format="full"
+        ).execute()
+        found = find_assignment_form(candidate)
+        if found:
+            msg = candidate
+            case_id, fname_owner = found
+            break
+    if msg is None:
+        sys.exit(
+            f"No email from {', '.join(search_emails)} "
+            f"with an Assignment_Form_*.pdf attachment"
+        )
+
+    owner = fname_owner if NAME_SOURCE == "filename" else owner_name_from_header(msg)
+    print(f"Email: {header(msg, 'Subject')!r}  case={case_id}  owner={owner}")
+
+    folder_name = safe_filename(f"{case_id}.{owner}")
+    claims_root = find_claims_folder()
+    if claims_root is not None:
+        folder = claims_root / folder_name          # synced Dropbox folder
+        use_api = False
+    else:
+        dbx = get_dropbox_client()                  # upload over the internet
+        folder = Path(tempfile.gettempdir()) / "MailDropbox" / folder_name
+        use_api = True
+    folder.mkdir(parents=True, exist_ok=True)
+    print(f"Folder: {folder}")
+
+    saved = download_attachments(service, msg, folder)
+
+    replacements = {OLD_NAME: owner, **EXTRA_REPLACEMENTS}
+    output_docx = folder / f"{safe_filename(owner)} - {TEMPLATE_DOCX.name}"  # overwrite on re-run
+    build_letter(TEMPLATE_DOCX, output_docx, replacements)
+    print(f"Letter created: {output_docx.name}")
+
+    # Remove "(1)", "(2)" copies left by earlier runs -> only this run's files stay
+    keep = {p.name for p in saved} | {output_docx.name}
+    cleanup_local(folder, keep, case_id)
+
+    if use_api:
+        upload_folder(dbx, folder, f"{DROPBOX_REMOTE_CLAIMS}/{folder_name}")
+        cleanup_remote(dbx, f"{DROPBOX_REMOTE_CLAIMS}/{folder_name}", keep, case_id)
+        print(f"Done: dropbox.com/home{DROPBOX_REMOTE_CLAIMS}/{folder_name}")
+
+    return {
+        "folder": folder,                       # local folder holding everything
+        "case_id": case_id,
+        "owner": owner,
+        "sender_email": sender_email,           # from the 'Email' column of info.csv
+        # sender name + the passenger names inside every Assignment_Form_*.pdf file name
+        "names": [fname_owner, owner_name_from_header(msg)] + [
+            nice_name(m.group(2))
+            for part in iter_attachment_parts(msg["payload"])
+            for m in [FORM_RE.match(part["filename"])] if m
+        ],
+        "attachments": saved,                   # downloaded attachment files
+        "letter": output_docx,                  # generated letter (.docx)
+    }
+
+
+def main():
+    run()
+
+
+if __name__ == "__main__":
+    main()
